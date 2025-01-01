@@ -11,20 +11,22 @@ import { JwtService } from '@nestjs/jwt';
 import { AuthService } from '../auth/auth.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { MessagesService } from '../messages/messages.service';
+import { RoomsService } from '../rooms/rooms.service';
 
 @WebSocketGateway({
   cors: {
-    origin: '*', // Настройте CORS согласно вашим требованиям
+    origin: '*', 
   },
 })
 export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer() server: Server;
 
   constructor(
-    private jwtService: JwtService,
-    private authService: AuthService,
-    private notificationsService: NotificationsService,
-    private messagesService: MessagesService,
+    private readonly jwtService: JwtService,
+    private readonly authService: AuthService,
+    private readonly notificationsService: NotificationsService,
+    private readonly messagesService: MessagesService,
+    private readonly roomsService: RoomsService,
   ) {}
 
   afterInit(server: Server) {
@@ -54,29 +56,51 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   }
 
   @SubscribeMessage('joinRoom')
-  handleJoinRoom(client: Socket, room: string) {
-    client.join(room);
-    this.server.to(room).emit('message', `${client.data.user.username} присоединился к комнате`);
+  async handleJoinRoom(client: Socket, roomId: number) {
+    const room = await this.roomsService.findOne(roomId);
+    if (!room) {
+      client.emit('error', 'Комната не найдена');
+      return;
+    }
+
+    client.join(`room-${roomId}`);
+    this.server.to(`room-${roomId}`).emit('message', `${client.data.user.username} присоединился к комнате ${room.name}`);
   }
 
   @SubscribeMessage('leaveRoom')
-  handleLeaveRoom(client: Socket, room: string) {
-    client.leave(room);
-    this.server.to(room).emit('message', `${client.data.user.username} покинул комнату`);
+  async handleLeaveRoom(client: Socket, roomId: number) {
+    const room = await this.roomsService.findOne(roomId);
+    if (!room) {
+      client.emit('error', 'Комната не найдена');
+      return;
+    }
+
+    client.leave(`room-${roomId}`);
+    this.server.to(`room-${roomId}`).emit('message', `${client.data.user.username} покинул комнату ${room.name}`);
   }
 
   @SubscribeMessage('sendMessage')
-  async handleMessage(client: Socket, payload: { room: string; message: string }) {
-    const { room, message } = payload;
+  async handleMessage(client: Socket, payload: { roomId: number; message: string }) {
+    const { roomId, message } = payload;
+    const room = await this.roomsService.findOne(roomId);
+    if (!room) {
+      client.emit('error', 'Комната не найдена');
+      return;
+    }
+
     const username = client.data.user.username;
 
     // Сохранение сообщения в базу данных
-    await this.messagesService.createMessage(username, room, message);
+    const savedMessage = await this.messagesService.createMessage(username, roomId, message);
 
     // Отправка сообщения всем в комнате
-    this.server.to(room).emit('message', { user: username, message });
+    this.server.to(`room-${roomId}`).emit('message', {
+      user: username,
+      message: message,
+      created_at: savedMessage.created_at,
+    });
 
     // Добавление задачи в очередь для отправки уведомления
-    await this.notificationsService.sendNotification({ user: username, message, room });
+    await this.notificationsService.sendNotification({ user: username, message, roomId });
   }
 }
